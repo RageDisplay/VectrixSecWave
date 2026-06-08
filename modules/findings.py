@@ -62,6 +62,10 @@ class Finding:
     confidence: float = 1.0
     verification_log: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
+    # Candidate kind that produced this finding (e.g. "ssrf", "disclosure"), or ""
+    # for deterministic findings — lets later phases (chains.py) dispatch on the
+    # underlying technique without fragile title/category string-matching.
+    kind: str = ""
 
 
 @dataclass

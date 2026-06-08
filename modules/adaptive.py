@@ -411,6 +411,7 @@ def run_confirmation_pass(session: requests.Session, base_url: str, store: Findi
 
         if verdict.outcome == Outcome.CONFIRMED:
             finding.status = "confirmed-deep-dive"
+            finding.kind = candidate.kind
             finding.confidence = max(finding.confidence, 0.85)
             if verdict.new_severity is not None:
                 finding.severity = verdict.new_severity
@@ -435,6 +436,7 @@ def run_confirmation_pass(session: requests.Session, base_url: str, store: Findi
 
         else:  # INCONCLUSIVE
             finding.status = "unverified"
+            finding.kind = candidate.kind
             finding.confidence = min(finding.confidence, 0.5)
             finding.severity = _downgrade(finding.severity)
             finding.verification_log.append(f"UNVERIFIED ({candidate.kind}): {verdict.reason}")

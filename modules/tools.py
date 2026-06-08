@@ -27,27 +27,33 @@ def _run(cmd: list[str], timeout: int = 120) -> tuple[str, str, int]:
         return "", f"Timeout: {cmd}", 1
 
 
-def run_all_tools(session: requests.Session, base_url: str, store) -> None:
+def run_all_tools(session: requests.Session, base_url: str, store) -> list[str]:
     print("[*] Running external Kali tools...")
     cookie_str = "; ".join(f"{k}={v}" for k, v in session.cookies.items())
     auth_header = session.headers.get("Authorization", "")
 
-    _run_whatweb(base_url, cookie_str, auth_header, store)
+    tech_names = _run_whatweb(base_url, cookie_str, auth_header, store)
     _run_wafw00f(base_url, store)
     _run_nikto(base_url, cookie_str, auth_header, store)
     _run_nuclei(base_url, cookie_str, auth_header, store)
+    return tech_names
 
 
-def _run_whatweb(base_url, cookie_str, auth_header, store):
+_WHATWEB_TECH_RE = re.compile(r"([A-Za-z][\w\-.]*)\[")
+
+
+def _run_whatweb(base_url, cookie_str, auth_header, store) -> list[str]:
     if not _tool_available("whatweb"):
-        return
+        return []
     print("  [*] whatweb — технология...")
     cmd = ["whatweb", "--colour=never", "-a", "3", base_url]
     if cookie_str:
         cmd += ["--cookie", cookie_str]
     stdout, stderr, rc = _run(cmd, timeout=60)
 
+    tech_names: list[str] = []
     if stdout.strip():
+        tech_names = sorted({m.lower() for m in _WHATWEB_TECH_RE.findall(stdout)})
         store.add(Finding(
             title="Обнаружение технологий (whatweb)",
             severity=Severity.INFO,
@@ -62,6 +68,7 @@ def _run_whatweb(base_url, cookie_str, auth_header, store):
             ),
             reproduction=f"whatweb --colour=never -a 3 '{base_url}'",
         ))
+    return tech_names
 
 
 def _run_wafw00f(base_url, store):
@@ -200,31 +207,103 @@ def _run_nikto(base_url, cookie_str, auth_header, store):
                     ))
 
 
-def _run_nuclei(base_url, cookie_str, auth_header, store):
+# Maps technology/plugin names (as parsed from whatweb output) to relevant nuclei
+# tags — lets the scan focus on templates that actually match the detected stack
+# instead of running the same generic CVE pass against every target.
+TECH_TO_NUCLEI_TAGS: dict[str, list[str]] = {
+    "wordpress": ["wordpress", "wp-plugin"],
+    "drupal": ["drupal"],
+    "joomla": ["joomla"],
+    "jenkins": ["jenkins"],
+    "gitlab": ["gitlab"],
+    "grafana": ["grafana"],
+    "jira": ["jira", "atlassian"],
+    "confluence": ["confluence", "atlassian"],
+    "tomcat": ["tomcat", "apache"],
+    "spring": ["springboot", "spring"],
+    "laravel": ["laravel", "php"],
+    "django": ["django", "python"],
+    "magento": ["magento"],
+    "nginx": ["nginx"],
+    "apache": ["apache"],
+    "iis": ["iis", "microsoft"],
+    "php": ["php"],
+}
+
+
+def _tech_tags(tech_names: list[str]) -> list[str]:
+    """Maps detected technology names to nuclei tags, deduplicated, order-preserving."""
+    seen: set[str] = set()
+    tags: list[str] = []
+    for name in tech_names:
+        for tag in TECH_TO_NUCLEI_TAGS.get(name, []):
+            if tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
+    return tags
+
+
+def _run_nuclei(base_url, cookie_str, auth_header, store,
+                endpoints=None, extra_tags=None, max_targets: int = 30,
+                full_tags: bool = True):
     if not _tool_available("nuclei"):
         return
     print("  [*] nuclei — template-based scanner...")
 
+    base_tags = ["cve", "oast", "exposure", "misconfig", "token"] if full_tags \
+        else ["cve", "exposure", "misconfig"]
+    tags: list[str] = []
+    for tag in base_tags + list(extra_tags or []):
+        if tag not in tags:
+            tags.append(tag)
+
+    targets_file = None
     cmd = [
         "nuclei",
-        "-u", base_url,
         "-severity", "critical,high,medium",
         "-silent",
         "-json",
         "-timeout", "10",
         "-c", "20",             # 20 concurrent
         "-rl", "50",            # rate limit
-        "-tags", "cve,oast,exposure,misconfig,token",
+        "-tags", ",".join(tags),
         "-no-color",
     ]
+
+    target_urls = [base_url]
+    if endpoints:
+        seen = {base_url}
+        for ep in endpoints:
+            ep_url = getattr(ep, "base_url", ep.url)
+            if ep_url not in seen:
+                seen.add(ep_url)
+                target_urls.append(ep_url)
+            if len(target_urls) >= max_targets:
+                break
+
+    if len(target_urls) > 1:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+            tmp.write("\n".join(target_urls))
+            targets_file = tmp.name
+        cmd += ["-l", targets_file]
+    else:
+        cmd += ["-u", base_url]
 
     if cookie_str:
         cmd += ["-H", f"Cookie: {cookie_str}"]
     if auth_header:
         cmd += ["-H", f"Authorization: {auth_header}"]
 
-    print("  [*] nuclei запущен (может занять 5-10 минут)...")
-    stdout, stderr, rc = _run(cmd, timeout=600)
+    print(f"  [*] nuclei запущен на {len(target_urls)} цел(ях), теги: {','.join(tags)} "
+          f"(может занять 5-10 минут)...")
+    try:
+        stdout, stderr, rc = _run(cmd, timeout=600)
+    finally:
+        if targets_file:
+            try:
+                Path(targets_file).unlink()
+            except OSError:
+                pass
 
     for line in stdout.split("\n"):
         line = line.strip()
