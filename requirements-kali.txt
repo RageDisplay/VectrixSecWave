@@ -1,0 +1,26 @@
+# Все пакеты доступны в официальных репозиториях Kali Linux
+# Установка одной командой:
+#   sudo apt install python3-requests python3-bs4 python3-urllib3
+
+# Системные пакеты (apt):
+# python3-requests
+# python3-bs4         (BeautifulSoup4)
+# python3-urllib3     (устанавливается с requests)
+
+# Инструменты Kali (apt, уже в репах):
+# nikto
+# nuclei
+# gobuster
+# sqlmap
+# whatweb
+# wafw00f
+# sslscan
+# dirb
+# hydra               (для брутфорса форм, если нужно)
+# jwt-tool            (pip3 install jwt_tool  — или из github)
+#
+# Установить всё:
+#   sudo apt update && sudo apt install -y \
+#     python3-requests python3-bs4 \
+#     nikto nuclei gobuster sqlmap \
+#     whatweb wafw00f sslscan dirb
