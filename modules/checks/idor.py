@@ -4,6 +4,7 @@ import uuid
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 
+from ..adaptive import Candidate
 from ..findings import Finding, Severity
 from ..session import session_to_curl_flags
 
@@ -61,35 +62,41 @@ def _check_numeric_ids_in_path(session, ep, curl_auth, timeout, store):
 
             if resp.status_code == 200 and abs(len(resp.text) - original_len) < len(resp.text) * 0.5:
                 if len(resp.text) > 50:
-                    store.add(Finding(
-                        title=f"Потенциальный IDOR — /{resource}/{{id}} доступен без смены владельца",
-                        severity=Severity.HIGH,
-                        category="IDOR / BOLA",
-                        cwe="CWE-639",
-                        description=(
-                            f"Запрос к /{resource}/{probe_id} вернул 200 и содержательный ответ. "
-                            f"Текущий ID: {current_id}, проверенный: {probe_id}. "
-                            "Если пользователь может читать данные другого пользователя — это BOLA (Broken Object Level Authorization)."
+                    store.add_candidate(Candidate(
+                        finding=Finding(
+                            title=f"Потенциальный IDOR — /{resource}/{{id}} доступен без смены владельца",
+                            severity=Severity.MEDIUM,
+                            category="IDOR / BOLA",
+                            cwe="CWE-639",
+                            description=(
+                                f"Запрос к /{resource}/{probe_id} вернул 200 и ответ, по объёму схожий "
+                                f"с оригиналом. Текущий ID: {current_id}, проверенный: {probe_id}. "
+                                "Если пользователь может читать данные другого пользователя — это BOLA "
+                                "(Broken Object Level Authorization). Похожий объём ответа сам по себе "
+                                "не доказывает доступ к чужим данным — требуется проверка содержимого."
+                            ),
+                            url=new_url,
+                            evidence=(
+                                f"Оригинал ({current_id}): HTTP {original_code}, {original_len} байт\n"
+                                f"Зонд ({probe_id}): HTTP {resp.status_code}, {len(resp.text)} байт\n"
+                                f"Фрагмент ответа: {resp.text[:200]}"
+                            ),
+                            remediation=(
+                                "1. Проверяйте на стороне сервера, что объект принадлежит аутентифицированному пользователю.\n"
+                                "2. Используйте indirect references (UUID) вместо последовательных числовых ID.\n"
+                                "3. Централизованная авторизация на уровне ORM/репозитория."
+                            ),
+                            reproduction=(
+                                f"# Оригинальный запрос:\n"
+                                f"curl -sk {curl_auth} '{ep.url}'\n\n"
+                                f"# Замена ID на соседний:\n"
+                                f"curl -sk {curl_auth} '{new_url}'"
+                            ),
                         ),
-                        url=new_url,
-                        evidence=(
-                            f"Оригинал ({current_id}): HTTP {original_code}, {original_len} байт\n"
-                            f"Зонд ({probe_id}): HTTP {resp.status_code}, {len(resp.text)} байт\n"
-                            f"Фрагмент ответа: {resp.text[:200]}"
-                        ),
-                        remediation=(
-                            "1. Проверяйте на стороне сервера, что объект принадлежит аутентифицированному пользователю.\n"
-                            "2. Используйте indirect references (UUID) вместо последовательных числовых ID.\n"
-                            "3. Централизованная авторизация на уровне ORM/репозитория."
-                        ),
-                        reproduction=(
-                            f"# Оригинальный запрос:\n"
-                            f"curl -sk {curl_auth} '{ep.url}'\n\n"
-                            f"# Замена ID на соседний:\n"
-                            f"curl -sk {curl_auth} '{new_url}'"
-                        ),
+                        kind="idor",
+                        context={"original_resp": original_resp, "probe_resp": resp},
                     ))
-                    break  # One finding per endpoint is enough
+                    break  # One candidate per endpoint is enough
 
 
 def _check_numeric_ids_in_params(session, ep, curl_auth, timeout, store):

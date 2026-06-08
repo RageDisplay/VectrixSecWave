@@ -4,7 +4,13 @@ import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .findings import Severity, Finding, FindingStore
+from .findings import DiscardedCandidate, Severity, Finding, FindingStore
+
+STATUS_LABELS = {
+    "confirmed": "",
+    "confirmed-deep-dive": "✓ Подтверждено доп. проверкой",
+    "unverified": "⚠ Не подтверждено автоматически — требуется ручная проверка",
+}
 
 RESET = "\033[0m"
 BOLD  = "\033[1m"
@@ -41,6 +47,9 @@ def _print_finding(f: Finding) -> None:
     print(f"  {color}URL:{RESET} {f.url}")
     if f.parameter:
         print(f"  {color}Parameter:{RESET} {f.parameter}")
+    status_label = STATUS_LABELS.get(f.status, "")
+    if status_label:
+        print(f"  {color}Статус проверки:{RESET} {status_label} (confidence: {f.confidence:.2f})")
     print()
     print(f"  {BOLD}Описание:{RESET}")
     for line in f.description.split("\n"):
@@ -49,6 +58,14 @@ def _print_finding(f: Finding) -> None:
         print(f"\n  {BOLD}Доказательства:{RESET}")
         for line in f.evidence.split("\n"):
             print(f"    {line}")
+    if f.verification_log:
+        print(f"\n  {BOLD}Журнал доп. проверки:{RESET}")
+        for line in f.verification_log:
+            print(f"    - {line}")
+    if f.artifacts:
+        print(f"\n  {BOLD}Извлечённые артефакты:{RESET}")
+        for a in f.artifacts:
+            print(f"    - {a}")
     print(f"\n  {BOLD}Как воспроизвести:{RESET}")
     for line in f.reproduction.split("\n"):
         print(f"    {line}")
@@ -77,8 +94,16 @@ def save_json(store: FindingStore, path: Path, meta: dict) -> None:
                 "evidence": f.evidence,
                 "reproduction": f.reproduction,
                 "remediation": f.remediation,
+                "status": f.status,
+                "confidence": f.confidence,
+                "verification_log": f.verification_log,
+                "artifacts": f.artifacts,
             }
             for f in store.all()
+        ],
+        "discarded_candidates": [
+            {"title": d.title, "kind": d.kind, "reason": d.reason}
+            for d in store.discarded()
         ],
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -148,6 +173,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .endpoint-list {{ max-height: 300px; overflow-y: auto; }}
   .endpoint-item {{ padding: 6px 0; border-bottom: 1px solid var(--border); font-family: monospace; font-size: 0.85em; color: var(--text2); }}
   .endpoint-item .method {{ display: inline-block; width: 50px; color: #a3e635; font-weight: bold; }}
+  .verify-badge {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.8em; font-weight: 600; margin-top: 12px; }}
+  .verify-badge.confirmed {{ background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid #4ade80; }}
+  .verify-badge.unverified {{ background: rgba(217,119,6,0.15); color: #fbbf24; border: 1px solid #fbbf24; }}
+  .verify-log {{ margin: 6px 0 0 18px; color: var(--text2); font-size: 0.85em; }}
+  .verify-log li {{ margin-bottom: 4px; }}
+  .artifact-list {{ list-style: none; margin-top: 4px; }}
+  .artifact-list li {{ margin-bottom: 4px; }}
+  .artifact-list a {{ color: #38bdf8; font-family: monospace; font-size: 0.85em; word-break: break-all; }}
+  .discarded-section {{ background: var(--bg2); border-radius: 10px; margin-bottom: 16px; border: 1px solid var(--border); overflow: hidden; }}
+  .discarded-header {{ padding: 14px 20px; cursor: pointer; user-select: none; color: var(--text2); font-weight: 600; }}
+  .discarded-header:hover {{ background: var(--bg3); }}
+  .discarded-body {{ padding: 0 20px 16px; display: none; }}
+  .discarded-body.open {{ display: block; }}
+  .discarded-item {{ padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 0.85em; }}
+  .discarded-item .d-title {{ color: var(--text); font-weight: 600; }}
+  .discarded-item .d-reason {{ color: var(--text2); }}
   @media (max-width: 768px) {{ .summary {{ grid-template-columns: repeat(3, 1fr); }} }}
 </style>
 </head>
@@ -172,6 +213,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   {endpoints_section}
 
+  {discarded_section}
+
   <div class="filter-bar">
     <span style="color:var(--text2);font-size:0.85em;">Фильтр:</span>
     <button class="filter-btn all active" onclick="filterFindings('all')">Все</button>
@@ -191,6 +234,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 function toggleFinding(id) {{
   const body = document.getElementById('body-' + id);
   body.classList.toggle('open');
+}}
+function toggleDiscarded() {{
+  const body = document.getElementById('discarded-body');
+  if (body) body.classList.toggle('open');
 }}
 function filterFindings(sev) {{
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
@@ -225,6 +272,8 @@ FINDING_TEMPLATE = """
     <div class="field-value">{description}</div>
     <div class="field-label">Доказательства</div>
     <pre>{evidence}</pre>
+    {verify_block}
+    {artifacts_block}
     <div class="field-label">Как воспроизвести</div>
     <pre>{reproduction}</pre>
     <div class="field-label">Рекомендации</div>
@@ -252,6 +301,30 @@ def save_html(store: FindingStore, path: Path, meta: dict, endpoints: list) -> N
             f'<div class="url-pill">{_esc(f.parameter)}</div>'
             if f.parameter else ""
         )
+
+        verify_block = ""
+        badge_label = STATUS_LABELS.get(f.status, "")
+        if badge_label:
+            badge_class = "confirmed" if f.status == "confirmed-deep-dive" else "unverified"
+            verify_block = (
+                f'<span class="verify-badge {badge_class}">'
+                f'{_esc(badge_label)} (confidence: {f.confidence:.2f})</span>'
+            )
+            if f.verification_log:
+                log_items = "\n".join(f"<li>{_esc(line)}</li>" for line in f.verification_log)
+                verify_block += f'<ul class="verify-log">{log_items}</ul>'
+
+        artifacts_block = ""
+        if f.artifacts:
+            links = "\n".join(
+                f'<li><a href="{_esc(a)}" target="_blank">{_esc(a)}</a></li>'
+                for a in f.artifacts
+            )
+            artifacts_block = (
+                '<div class="field-label">Извлечённые артефакты</div>'
+                f'<ul class="artifact-list">{links}</ul>'
+            )
+
         findings_html_parts.append(FINDING_TEMPLATE.format(
             sev_lower=f.severity.value.lower(),
             sev=f.severity.value,
@@ -263,6 +336,8 @@ def save_html(store: FindingStore, path: Path, meta: dict, endpoints: list) -> N
             param_block=param_block,
             description=_esc(f.description).replace("\n", "<br>"),
             evidence=_esc(f.evidence or "—"),
+            verify_block=verify_block,
+            artifacts_block=artifacts_block,
             reproduction=_esc(f.reproduction or "—"),
             remediation=_esc(f.remediation).replace("\n", "<br>"),
         ))
@@ -278,6 +353,23 @@ def save_html(store: FindingStore, path: Path, meta: dict, endpoints: list) -> N
             f'<div class="endpoints-section"><div class="endpoint-list">{items}</div></div>'
         )
 
+    discarded = store.discarded()
+    discarded_section = ""
+    if discarded:
+        items = "\n".join(
+            f'<div class="discarded-item"><div class="d-title">[{_esc(d.kind)}] {_esc(d.title)}</div>'
+            f'<div class="d-reason">{_esc(d.reason)}</div></div>'
+            for d in discarded
+        )
+        discarded_section = (
+            f'<div class="discarded-section">'
+            f'<div class="discarded-header" onclick="toggleDiscarded()">'
+            f'▾ Отброшено автоматической проверкой ({len(discarded)}) — '
+            f'кандидаты, не подтвердившиеся при углублённой проверке</div>'
+            f'<div class="discarded-body" id="discarded-body">{items}</div>'
+            f'</div>'
+        )
+
     html = HTML_TEMPLATE.format(
         target=_esc(meta.get("target", "")),
         date=meta.get("date", ""),
@@ -288,6 +380,7 @@ def save_html(store: FindingStore, path: Path, meta: dict, endpoints: list) -> N
         c_low=counts["LOW"],
         c_info=counts["INFO"],
         endpoints_section=endpoints_section,
+        discarded_section=discarded_section,
         findings_html="\n".join(findings_html_parts),
     )
 

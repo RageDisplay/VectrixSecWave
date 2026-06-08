@@ -1,8 +1,10 @@
 from __future__ import annotations
 import re
+import uuid
 from urllib.parse import urljoin
 import requests
 
+from ..adaptive import Candidate
 from ..findings import Finding, Severity
 from ..session import session_to_curl_flags
 
@@ -150,7 +152,32 @@ def run(session: requests.Session, base_url: str, endpoints: list, store) -> Non
     _check_graphql(session, base_url, curl_auth, timeout, store)
 
 
+def _get_fallback_baseline(session, base_url):
+    """Запрашивает заведомо несуществующий путь, чтобы определить
+    catch-all поведение SPA (сервер отдаёт index.html на любой путь
+    с кодом 200 вместо 404). Возвращает (status_code, body) или None."""
+    probe_path = f"/__nonexistent_{uuid.uuid4().hex}__"
+    url = base_url.rstrip("/") + probe_path
+    try:
+        resp = session.get(url, timeout=8, allow_redirects=True)
+    except Exception:
+        return None
+    return resp.status_code, resp.text
+
+
+def _looks_like_fallback(resp, baseline):
+    """True, если ответ совпадает с baseline-ответом на случайный
+    несуществующий путь — значит сервер просто фоллбэчит на одну
+    страницу (SPA catch-all), а не реально отдаёт запрошенный ресурс."""
+    if baseline is None:
+        return False
+    base_status, base_body = baseline
+    return resp.status_code == base_status and resp.text == base_body
+
+
 def _check_sensitive_paths(session, base_url, curl_auth, timeout, store):
+    baseline = _get_fallback_baseline(session, base_url)
+
     for path, label in SENSITIVE_PATHS.items():
         url = base_url.rstrip("/") + path
         try:
@@ -161,34 +188,65 @@ def _check_sensitive_paths(session, base_url, curl_auth, timeout, store):
         if resp.status_code in (404, 410, 501):
             continue
 
-        severity = Severity.HIGH
-        if resp.status_code in (401, 403):
-            severity = Severity.INFO
-        elif path in ("/.env", "/.git/config", "/actuator/env", "/actuator/heapdump",
-                      "/backup.sql", "/credentials.json", "/secrets.json", "/private.key"):
-            severity = Severity.CRITICAL
+        if _looks_like_fallback(resp, baseline):
+            # Сервер отдаёт идентичный ответ на любой путь (SPA fallback /
+            # catch-all маршрутизация) — это не утечка ресурса, а особенность
+            # роутинга. Реальной находки здесь нет.
+            continue
 
         ct = resp.headers.get("content-type", "").lower()
         body_snippet = resp.text[:300].replace("\n", " ")
 
-        store.add(Finding(
-            title=f"Доступен чувствительный путь: {path} ({label})",
-            severity=severity,
-            category="Information Disclosure",
-            cwe="CWE-200",
-            description=(
-                f"URL '{url}' возвращает HTTP {resp.status_code}.\n"
-                f"Ресурс: {label}\n"
-                f"Content-Type: {ct or 'не указан'}"
+        # 401/403 is just "the path exists and is gated" — deterministic, no need to dig deeper
+        if resp.status_code in (401, 403):
+            store.add(Finding(
+                title=f"Обнаружен защищённый путь: {path} ({label})",
+                severity=Severity.INFO,
+                category="Information Disclosure",
+                cwe="CWE-200",
+                description=(
+                    f"URL '{url}' существует и возвращает HTTP {resp.status_code} "
+                    f"(требует авторизации).\nРесурс: {label}"
+                ),
+                url=url,
+                evidence=f"HTTP {resp.status_code}\n{body_snippet}",
+                remediation=(
+                    f"Путь {path} закрыт авторизацией — это ожидаемое поведение, "
+                    "дополнительных действий не требуется. Убедитесь, что 401/403 "
+                    "не отдаёт лишних деталей о структуре приложения."
+                ),
+                reproduction=f"curl -sk {curl_auth} '{url}'",
+            ))
+            continue
+
+        # 200 (or any other non-gated status) on a sensitive path is a *weak* signal —
+        # the survivors of the SPA-fallback filter still need content-level confirmation
+        # (real secret signature vs. generic page) before we call them HIGH/CRITICAL.
+        store.add_candidate(Candidate(
+            finding=Finding(
+                title=f"Доступен чувствительный путь: {path} ({label})",
+                severity=Severity.MEDIUM,
+                category="Information Disclosure",
+                cwe="CWE-200",
+                description=(
+                    f"URL '{url}' возвращает HTTP {resp.status_code} и отличается от "
+                    f"стандартного fallback-ответа сервера.\n"
+                    f"Ресурс: {label}\n"
+                    f"Content-Type: {ct or 'не указан'}\n"
+                    "Сам по себе нестандартный ответ ещё не доказывает утечку — "
+                    "требуется проверка содержимого на признаки реального секрета/исходника."
+                ),
+                url=url,
+                evidence=f"HTTP {resp.status_code}\n{body_snippet}",
+                remediation=(
+                    f"1. Закройте доступ к {path} на уровне веб-сервера / файрвола.\n"
+                    "2. Удалите чувствительные файлы из webroot.\n"
+                    "3. Ограничьте Actuator-эндпоинты (management.endpoints.web.exposure.include)."
+                ),
+                reproduction=f"curl -sk {curl_auth} '{url}'",
             ),
-            url=url,
-            evidence=f"HTTP {resp.status_code}\n{body_snippet}",
-            remediation=(
-                f"1. Закройте доступ к {path} на уровне веб-сервера / файрвола.\n"
-                "2. Удалите чувствительные файлы из webroot.\n"
-                "3. Ограничьте Actuator-эндпоинты (management.endpoints.web.exposure.include)."
-            ),
-            reproduction=f"curl -sk {curl_auth} '{url}'",
+            kind="disclosure",
+            context={"path": path, "url": url, "label": label},
         ))
 
 

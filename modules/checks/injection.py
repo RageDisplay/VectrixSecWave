@@ -5,6 +5,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from typing import Any
 import requests
 
+from ..adaptive import Candidate
 from ..findings import Finding, Severity
 from ..session import session_to_curl_flags
 
@@ -173,33 +174,45 @@ def _check_sqli(session, ep, params, body_params, curl_auth, timeout, store,
             for sig in SQL_ERROR_SIGNATURES:
                 if re.search(sig, text, re.IGNORECASE):
                     curl_cmd = _make_curl(ep, param_name, payload, curl_auth, params, body_params)
-                    store.add(Finding(
-                        title=f"SQL Injection (Error-based) — параметр '{param_name}'",
-                        severity=Severity.CRITICAL,
-                        category="Injection",
-                        cwe="CWE-89",
-                        description=(
-                            f"Обнаружена SQL-инъекция в параметре '{param_name}' ({ep.method} {ep.url}).\n"
-                            f"Техника: {technique}\n"
-                            f"Сигнатура в ответе: {sig}"
+
+                    def _probe(new_payload, _ep=ep, _param=param_name, _params=params,
+                               _body=body_params, _timeout=timeout):
+                        return _inject_param(session, _ep, _param, new_payload, _params, _body, _timeout)
+
+                    store.add_candidate(Candidate(
+                        finding=Finding(
+                            title=f"SQL Injection (Error-based) — параметр '{param_name}'",
+                            severity=Severity.HIGH,
+                            category="Injection",
+                            cwe="CWE-89",
+                            description=(
+                                f"Один payload вызвал в ответе сигнатуру SQL-ошибки в параметре "
+                                f"'{param_name}' ({ep.method} {ep.url}).\n"
+                                f"Техника: {technique}\n"
+                                f"Сигнатура в ответе: {sig}\n"
+                                "Единичное совпадение сигнатуры может быть и обычной страницей "
+                                "ошибки приложения — нужна дифференциальная проверка true/false условий."
+                            ),
+                            url=ep.url,
+                            parameter=param_name,
+                            method=ep.method,
+                            evidence=f"Payload: {payload}\nОтвет содержит: {re.search(sig, text, re.IGNORECASE).group()[:200]}",
+                            remediation=(
+                                "1. Используйте параметризованные запросы / Prepared Statements.\n"
+                                "2. Никогда не подставляйте пользовательский ввод напрямую в SQL.\n"
+                                "3. Применяйте ORM с экранированием.\n"
+                                "4. Запустите sqlmap для полного exploitation: "
+                                f"sqlmap -u '{ep.url}' -p '{param_name}' --dbs"
+                            ),
+                            reproduction=(
+                                f"# Ручная проверка:\n{curl_cmd}\n\n"
+                                f"# Автоматизация через sqlmap:\n"
+                                f"sqlmap -u '{ep.url}' -p '{param_name}' "
+                                f"--cookie '{_cookies_str(session)}' --batch --dbs"
+                            ),
                         ),
-                        url=ep.url,
-                        parameter=param_name,
-                        method=ep.method,
-                        evidence=f"Payload: {payload}\nОтвет содержит: {re.search(sig, text, re.IGNORECASE).group()[:200]}",
-                        remediation=(
-                            "1. Используйте параметризованные запросы / Prepared Statements.\n"
-                            "2. Никогда не подставляйте пользовательский ввод напрямую в SQL.\n"
-                            "3. Применяйте ORM с экранированием.\n"
-                            "4. Запустите sqlmap для полного exploitation: "
-                            f"sqlmap -u '{ep.url}' -p '{param_name}' --dbs"
-                        ),
-                        reproduction=(
-                            f"# Ручная проверка:\n{curl_cmd}\n\n"
-                            f"# Автоматизация через sqlmap:\n"
-                            f"sqlmap -u '{ep.url}' -p '{param_name}' "
-                            f"--cookie '{_cookies_str(session)}' --batch --dbs"
-                        ),
+                        kind="sqli",
+                        context={"probe": _probe, "parameter": param_name},
                     ))
                     break  # Found for this payload, move to next param
             else:

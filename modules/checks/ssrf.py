@@ -4,6 +4,7 @@ import time
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 
+from ..adaptive import Candidate
 from ..findings import Finding, Severity
 from ..session import session_to_curl_flags
 
@@ -121,31 +122,47 @@ def _check_endpoint_ssrf(session, ep, curl_auth, timeout, store):
                     ))
                     break
 
-            # Check for response length difference (blind SSRF indicator)
+            # Check for response length difference (blind SSRF indicator) — weak signal,
+            # route through the adaptive verifier for a differential re-check before publishing
             if resp.status_code == 200 and baseline_code != 200:
                 if len(resp.text) > 200:
-                    store.add(Finding(
-                        title=f"Потенциальный Blind SSRF — параметр '{param}'",
-                        severity=Severity.MEDIUM,
-                        category="SSRF",
-                        cwe="CWE-918",
-                        description=(
-                            f"Запрос с payload '{payload}' в параметре '{param}' "
-                            f"вернул HTTP 200, тогда как базовый запрос вернул {baseline_code}. "
-                            "Требует ручной верификации через внешний коллаборатор (Burp Collaborator, interactsh)."
+                    def _probe(new_payload, _param=param, _qs=qs, _parsed=parsed, _timeout=timeout):
+                        nq = _qs.copy()
+                        nq[_param] = [new_payload]
+                        url = urlunparse((_parsed.scheme, _parsed.netloc, _parsed.path,
+                                          _parsed.params, urlencode(nq, doseq=True), ""))
+                        try:
+                            return session.get(url, timeout=_timeout, allow_redirects=True)
+                        except Exception:
+                            return None
+
+                    store.add_candidate(Candidate(
+                        finding=Finding(
+                            title=f"Потенциальный Blind SSRF — параметр '{param}'",
+                            severity=Severity.LOW,
+                            category="SSRF",
+                            cwe="CWE-918",
+                            description=(
+                                f"Запрос с payload '{payload}' в параметре '{param}' "
+                                f"вернул HTTP 200, тогда как базовый запрос вернул {baseline_code}. "
+                                "Само по себе изменение статус-кода — слабый индикатор (могло быть "
+                                "вызвано форматом значения параметра, а не реальным исходящим запросом)."
+                            ),
+                            url=ep.url,
+                            parameter=param,
+                            evidence=f"Baseline: {baseline_code}\nSSRF probe: {resp.status_code}",
+                            remediation=(
+                                "1. Запретите серверу делать исходящие запросы к произвольным URL.\n"
+                                "2. Используйте allowlist для разрешённых адресов назначения."
+                            ),
+                            reproduction=(
+                                f"# Используйте interactsh для blind SSRF:\n"
+                                f"# 1. interactsh-client -v -o /tmp/interactsh.log &\n"
+                                f"# 2. Замените payload на ваш interactsh URL:\n"
+                                f"curl -sk {curl_auth} '{ep.url}?{param}=https://YOUR.oast.me/'\n"
+                                f"# 3. Проверьте /tmp/interactsh.log на входящие запросы"
+                            ),
                         ),
-                        url=ep.url,
-                        parameter=param,
-                        evidence=f"Baseline: {baseline_code}\nSSRF probe: {resp.status_code}",
-                        remediation=(
-                            "1. Запретите серверу делать исходящие запросы к произвольным URL.\n"
-                            "2. Используйте allowlist для разрешённых адресов назначения."
-                        ),
-                        reproduction=(
-                            f"# Используйте interactsh для blind SSRF:\n"
-                            f"# 1. interactsh-client -v -o /tmp/interactsh.log &\n"
-                            f"# 2. Замените payload на ваш interactsh URL:\n"
-                            f"curl -sk {curl_auth} '{ep.url}?{param}=https://YOUR.oast.me/'\n"
-                            f"# 3. Проверьте /tmp/interactsh.log на входящие запросы"
-                        ),
+                        kind="ssrf",
+                        context={"probe": _probe, "payload": payload},
                     ))

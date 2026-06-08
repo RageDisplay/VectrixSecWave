@@ -4,6 +4,8 @@ import sys
 import shutil
 import json
 import re
+import tempfile
+from pathlib import Path
 from urllib.parse import urlparse
 import requests
 
@@ -263,6 +265,53 @@ def _run_nuclei(base_url, cookie_str, auth_header, store):
             remediation=remediation,
             reproduction=curl_line or f"nuclei -u '{matched_at}' -t {template_id}",
         ))
+
+
+def run_custom_nuclei_template(session: requests.Session, base_url: str, template_yaml: str,
+                               label: str = "") -> list[dict]:
+    """Запускает nuclei с динамически сгенерированным шаблоном (адаптивное углубление —
+    например, follow-up проверка соседних путей вокруг подтверждённой находки).
+
+    Возвращает разобранные совпадения как сырые dict'ы — решение, как использовать их
+    в Finding/Candidate, остаётся за вызывающим кодом (modules/adaptive.py)."""
+    if not _tool_available("nuclei"):
+        return []
+
+    cookie_str = "; ".join(f"{k}={v}" for k, v in session.cookies.items())
+    auth_header = session.headers.get("Authorization", "")
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8") as tmp:
+        tmp.write(template_yaml)
+        template_path = tmp.name
+
+    try:
+        cmd = [
+            "nuclei", "-u", base_url, "-t", template_path,
+            "-json", "-silent", "-no-color", "-timeout", "10",
+        ]
+        if cookie_str:
+            cmd += ["-H", f"Cookie: {cookie_str}"]
+        if auth_header:
+            cmd += ["-H", f"Authorization: {auth_header}"]
+
+        print(f"  [*] nuclei (сгенерированный шаблон{f' для ' + label if label else ''})...")
+        stdout, stderr, rc = _run(cmd, timeout=120)
+    finally:
+        try:
+            Path(template_path).unlink()
+        except OSError:
+            pass
+
+    matches = []
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            matches.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return matches
 
 
 def run_gobuster(session: requests.Session, base_url: str, store) -> list[str]:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
 
@@ -54,13 +54,46 @@ class Finding:
     cwe: str = ""
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
+    # ── Adaptive confirmation metadata ───────────────────────────────────
+    # "confirmed"           — deterministic check, no follow-up needed (default)
+    # "unverified"          — weak signal that couldn't be confirmed automatically
+    # "confirmed-deep-dive" — weak signal that the adaptive pass actively verified
+    status: str = "confirmed"
+    confidence: float = 1.0
+    verification_log: list[str] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DiscardedCandidate:
+    """A weak-signal candidate that the adaptive pass actively refuted.
+    Kept only for the report's transparency appendix — never becomes a Finding."""
+    title: str
+    kind: str
+    reason: str
+
 
 class FindingStore:
     def __init__(self):
         self._findings: list[Finding] = []
+        self._candidates: list[Any] = []   # list[adaptive.Candidate], kept as Any to avoid an import cycle
+        self._discarded: list[DiscardedCandidate] = []
 
     def add(self, finding: Finding) -> None:
         self._findings.append(finding)
+
+    def add_candidate(self, candidate: Any) -> None:
+        self._candidates.append(candidate)
+
+    def pop_candidates(self) -> list[Any]:
+        candidates, self._candidates = self._candidates, []
+        return candidates
+
+    def add_discarded(self, discarded: DiscardedCandidate) -> None:
+        self._discarded.append(discarded)
+
+    def discarded(self) -> list[DiscardedCandidate]:
+        return self._discarded
 
     def all(self) -> list[Finding]:
         return sorted(self._findings, key=lambda f: f.severity.weight, reverse=True)

@@ -8,6 +8,7 @@ import time
 from urllib.parse import urlparse, urlencode
 import requests
 
+from ..adaptive import Candidate
 from ..findings import Finding, Severity
 from ..session import session_to_curl_flags
 
@@ -324,26 +325,42 @@ def _check_auth_bypass_headers(session, base_url, curl_auth, timeout, store):
             )
             if bypass_resp.status_code == 200 and len(bypass_resp.text) > 100:
                 if abs(len(bypass_resp.text) - normal_len) > 200:
-                    store.add(Finding(
-                        title=f"Auth Bypass через заголовок '{header}'",
-                        severity=Severity.CRITICAL,
-                        category="Authentication",
-                        cwe="CWE-287",
-                        description=(
-                            f"Установка заголовка '{header}: {value}' изменяет ответ /admin "
-                            f"с {normal_code} на 200. Возможен обход авторизации."
+                    def _probe(_header=header, _value=value, _timeout=timeout):
+                        try:
+                            return session.get(base_url + "/admin", headers={_header: _value},
+                                               timeout=_timeout, allow_redirects=False)
+                        except Exception:
+                            return None
+
+                    store.add_candidate(Candidate(
+                        finding=Finding(
+                            title=f"Auth Bypass через заголовок '{header}'",
+                            severity=Severity.HIGH,
+                            category="Authentication",
+                            cwe="CWE-287",
+                            description=(
+                                f"Установка заголовка '{header}: {value}' изменяет ответ /admin "
+                                f"с {normal_code} на 200 и заметно меняет размер ответа. "
+                                "Изменение размера само по себе не доказывает обход авторизации "
+                                "(могла открыться, например, иная страница ошибки) — нужна проверка "
+                                "содержимого на admin-специфичные признаки."
+                            ),
+                            url=base_url + "/admin",
+                            evidence=f"Без заголовка: HTTP {normal_code} ({normal_len} байт), "
+                                     f"с заголовком: HTTP 200 ({len(bypass_resp.text)} байт)",
+                            remediation=(
+                                "1. Не доверяйте заголовкам X-Forwarded-For, X-Real-IP для авторизации.\n"
+                                "2. Авторизацию выполняйте на уровне приложения, не реверс-прокси.\n"
+                                "3. Используйте middleware для проверки прав доступа."
+                            ),
+                            reproduction=(
+                                f"curl -sk {curl_auth} -H '{header}: {value}' "
+                                f"'{base_url}/admin'"
+                            ),
                         ),
-                        url=base_url + "/admin",
-                        evidence=f"Без заголовка: {normal_code}, с заголовком: 200",
-                        remediation=(
-                            "1. Не доверяйте заголовкам X-Forwarded-For, X-Real-IP для авторизации.\n"
-                            "2. Авторизацию выполняйте на уровне приложения, не реверс-прокси.\n"
-                            "3. Используйте middleware для проверки прав доступа."
-                        ),
-                        reproduction=(
-                            f"curl -sk {curl_auth} -H '{header}: {value}' "
-                            f"'{base_url}/admin'"
-                        ),
+                        kind="auth_bypass",
+                        context={"probe": _probe, "baseline_resp": normal_resp,
+                                 "header": header, "value": value},
                     ))
         except Exception:
             pass
