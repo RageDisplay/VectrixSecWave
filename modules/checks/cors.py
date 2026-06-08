@@ -167,9 +167,12 @@ def _test_cors(session, url, curl_auth, timeout, store):
                 evidence=f"ACAO: {acao}",
                 remediation="Удалите 'null' из списка разрешённых Origins.",
                 reproduction=(
-                    f"# PoC через sandboxed iframe:\n"
-                    f"echo '<iframe sandbox=\"allow-scripts\" srcdoc='"
-                    f'"<script>fetch(\\'{url}\\',{{credentials:\\'include\\'}}).then(r=>r.text()).then(console.log)</script>"'
-                    f"'></iframe>' > /tmp/null_cors.html"
+                    f"# PoC: HTML-файл с sandboxed iframe (даёт Origin: null)\n"
+                    f"cat > /tmp/null_cors.html << 'EOF'\n"
+                    f"<iframe sandbox=\"allow-scripts\" src=\"data:text/html,"
+                    f"<script>fetch('{url}',{{credentials:'include'}})"
+                    f".then(r=>r.text()).then(d=>console.log(d))</script>\"></iframe>\n"
+                    f"EOF\n"
+                    f"python3 -m http.server 8888 --directory /tmp"
                 ),
             ))
