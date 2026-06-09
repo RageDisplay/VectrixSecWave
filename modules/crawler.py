@@ -71,6 +71,16 @@ INTERESTING_PATHS = [
     "/nonexistent-page-pentest-check",
 ]
 
+# Paths we never request automatically: they end the session, mutate state, or
+# are destructive. Hitting /logout with a live auth cookie would kill the whole
+# scan — exactly what we must avoid on time-limited bank sessions.
+DEFAULT_EXCLUDE_PATTERN = re.compile(
+    r"(/logout|/log-?off|/signout|/sign-out|/sessions?/destroy|/disconnect|"
+    r"/delete|/remove|/destroy|/drop|/purge|/deactivate|/close-?account|"
+    r"/revoke|/wipe|/terminate)",
+    re.IGNORECASE,
+)
+
 JS_URL_PATTERN = re.compile(
     r'(?:url|href|src|action|endpoint|api)["\s]*[:=]["\s]*'
     r'["\']([/][^"\'<>\s]{2,})["\']',
@@ -87,6 +97,7 @@ class Crawler:
         max_pages: int = 200,
         same_domain: bool = True,
         verbose: bool = False,
+        exclude_patterns: Optional[list[str]] = None,
     ):
         self.session = session
         self.base_url = base_url.rstrip("/")
@@ -97,6 +108,14 @@ class Crawler:
         self._parsed_base = urlparse(self.base_url)
         self._visited: set[str] = set()
         self.endpoints: list[Endpoint] = []
+        # User-supplied --exclude patterns, compiled and OR-ed with the defaults.
+        self._user_exclude = [re.compile(p, re.IGNORECASE) for p in (exclude_patterns or [])]
+
+    def _is_excluded(self, url: str) -> bool:
+        path_q = urlparse(url).path + "?" + urlparse(url).query
+        if DEFAULT_EXCLUDE_PATTERN.search(path_q):
+            return True
+        return any(p.search(url) for p in self._user_exclude)
 
     @property
     def _base_host(self) -> str:
@@ -114,6 +133,10 @@ class Crawler:
         if parsed.scheme not in ("http", "https"):
             return None
         if self.same_domain and not self._is_same_domain(full):
+            return None
+        if self._is_excluded(full):
+            if self.verbose:
+                print(f"  [-] excluded (deny-list): {full}")
             return None
         # Drop fragment
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path,
@@ -175,8 +198,6 @@ class Crawler:
             self._extract_from_js(text, url)
 
     def _extract_links(self, soup, source_url: str, depth: int, queue: deque) -> None:
-        tags = soup.find_all(["a", "link", "script", "img", "form"],
-                             href=True) + soup.find_all(src=True)
         for tag in soup.find_all(["a"]):
             href = tag.get("href", "")
             norm = self._normalise_url(href, source_url)
@@ -229,6 +250,8 @@ class Crawler:
         for path in INTERESTING_PATHS:
             url = base + path
             if any(e.url == url for e in self.endpoints):
+                continue
+            if self._is_excluded(url):
                 continue
             try:
                 resp = self.session.get(url, timeout=8, allow_redirects=False)

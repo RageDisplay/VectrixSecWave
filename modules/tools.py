@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import subprocess
 import sys
 import shutil
@@ -405,7 +406,7 @@ def run_gobuster(session: requests.Session, base_url: str, store) -> list[str]:
         "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
         "/usr/share/dirb/wordlists/common.txt",
     ]
-    wordlist = next((w for w in wordlists if shutil.os.path.exists(w)), None)
+    wordlist = next((w for w in wordlists if os.path.exists(w)), None)
     if not wordlist:
         print("  [!] No wordlist found for gobuster")
         return []
@@ -414,6 +415,8 @@ def run_gobuster(session: requests.Session, base_url: str, store) -> list[str]:
     cookie_str = "; ".join(f"{k}={v}" for k, v in session.cookies.items())
     auth_header = session.headers.get("Authorization", "")
 
+    out_fd, out_path = tempfile.mkstemp(prefix="gobuster_", suffix=".txt")
+    os.close(out_fd)
     cmd = [
         "gobuster", "dir",
         "-u", base_url,
@@ -421,7 +424,7 @@ def run_gobuster(session: requests.Session, base_url: str, store) -> list[str]:
         "-q",                   # quiet
         "-t", "30",             # threads
         "--no-error",
-        "-o", "/tmp/gobuster_pentest.txt",
+        "-o", out_path,
         "-x", "php,asp,aspx,jsp,json,yaml,xml,bak,old,txt",
         "--timeout", "10s",
     ]
@@ -435,12 +438,12 @@ def run_gobuster(session: requests.Session, base_url: str, store) -> list[str]:
     if parsed.scheme == "https":
         cmd += ["-k"]  # Skip TLS verification
 
-    _run(cmd, timeout=300)
-
-    # Read results
-    found = []
     try:
-        with open("/tmp/gobuster_pentest.txt") as f:
+        _run(cmd, timeout=300)
+
+        # Read results
+        found = []
+        with open(out_path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("["):
@@ -464,7 +467,12 @@ def run_gobuster(session: requests.Session, base_url: str, store) -> list[str]:
                                 reproduction=f"curl -sk '{url}'",
                             ))
     except FileNotFoundError:
-        pass
+        found = []
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
 
     return found
 
@@ -477,6 +485,7 @@ def run_sqlmap(session: requests.Session, url: str, param: str, store) -> None:
     cookie_str = "; ".join(f"{k}={v}" for k, v in session.cookies.items())
     print(f"  [*] sqlmap → {url} (param: {param})")
 
+    out_dir = tempfile.mkdtemp(prefix="sqlmap_")
     cmd = [
         "sqlmap", "-u", url,
         "-p", param,
@@ -485,7 +494,7 @@ def run_sqlmap(session: requests.Session, url: str, param: str, store) -> None:
         "--risk", "2",
         "--timeout", "10",
         "--retries", "2",
-        "--output-dir", "/tmp/sqlmap_pentest",
+        "--output-dir", out_dir,
         "--forms",
         "--crawl=2",
     ]
@@ -505,7 +514,7 @@ def run_sqlmap(session: requests.Session, url: str, param: str, store) -> None:
             cwe="CWE-89",
             description=(
                 f"sqlmap подтвердил SQL-инъекцию в параметре '{param}'.\n"
-                f"Полный вывод sqlmap в /tmp/sqlmap_pentest/"
+                f"Полный вывод sqlmap в {out_dir}/"
             ),
             url=url,
             parameter=param,

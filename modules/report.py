@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from .findings import DiscardedCandidate, Severity, Finding, FindingStore, OWASP_FULL_NAMES
+from .findings import DiscardedCandidate, Severity, Finding, FindingStore, OWASP_FULL_NAMES, USE_COLOR
 
 STATUS_LABELS = {
     "confirmed": "",
@@ -13,9 +13,9 @@ STATUS_LABELS = {
     "unverified": "⚠ Не подтверждено автоматически — требуется ручная проверка",
 }
 
-RESET = "\033[0m"
-BOLD  = "\033[1m"
-GREEN = "\033[32m"
+RESET = "\033[0m" if USE_COLOR else ""
+BOLD  = "\033[1m" if USE_COLOR else ""
+GREEN = "\033[32m" if USE_COLOR else ""
 
 
 # ── Console output ─────────────────────────────────────────────────────────────

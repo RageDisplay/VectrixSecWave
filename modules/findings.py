@@ -1,8 +1,16 @@
 from __future__ import annotations
+import os
+import sys
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 import uuid
+
+
+# Emit ANSI colour only to a real terminal, and honour the NO_COLOR convention.
+# When output is redirected to a file/pipe, codes would otherwise corrupt it.
+USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
 
 
 # OWASP Top 10 2021 — maps category keyword → (OWASP ID, short label)
@@ -54,6 +62,8 @@ class Severity(str, Enum):
 
     @property
     def color(self) -> str:
+        if not USE_COLOR:
+            return ""
         return {
             "CRITICAL": "\033[91m",
             "HIGH":     "\033[31m",
@@ -123,24 +133,62 @@ class DiscardedCandidate:
     reason: str
 
 
+def _fingerprint(f: Finding) -> tuple[str, str, str, str]:
+    """Identity used to collapse duplicate findings: same issue, same place.
+
+    URL includes the host, so findings from different targets never merge."""
+    return (f.title.strip(), f.url.rstrip("/"), f.parameter, f.method)
+
+
 class FindingStore:
     def __init__(self):
         self._findings: list[Finding] = []
+        self._index: dict[tuple[str, str, str, str], Finding] = {}
         self._candidates: list[Any] = []   # list[adaptive.Candidate], kept as Any to avoid an import cycle
         self._discarded: list[DiscardedCandidate] = []
+        # Checks may run concurrently — guard all mutations.
+        self._lock = threading.Lock()
 
     def add(self, finding: Finding) -> None:
-        self._findings.append(finding)
+        """Add a finding, collapsing exact duplicates.
+
+        When the same issue is reported twice (e.g. a missing header seen on
+        several endpoints, or one SSRF param hit by multiple checks) we keep a
+        single entry: the higher severity wins, evidence is merged, and
+        confidence is raised to the strongest signal."""
+        key = _fingerprint(finding)
+        with self._lock:
+            existing = self._index.get(key)
+            if existing is None:
+                self._findings.append(finding)
+                self._index[key] = finding
+                return
+
+            # Merge into the existing finding.
+            if finding.severity.weight > existing.severity.weight:
+                existing.severity = finding.severity
+            existing.confidence = max(existing.confidence, finding.confidence)
+            if finding.evidence and finding.evidence not in existing.evidence:
+                existing.evidence = (existing.evidence + "\n---\n" + finding.evidence).strip("\n-")
+            for entry in finding.verification_log:
+                if entry not in existing.verification_log:
+                    existing.verification_log.append(entry)
+            for art in finding.artifacts:
+                if art not in existing.artifacts:
+                    existing.artifacts.append(art)
 
     def add_candidate(self, candidate: Any) -> None:
-        self._candidates.append(candidate)
+        with self._lock:
+            self._candidates.append(candidate)
 
     def pop_candidates(self) -> list[Any]:
-        candidates, self._candidates = self._candidates, []
+        with self._lock:
+            candidates, self._candidates = self._candidates, []
         return candidates
 
     def add_discarded(self, discarded: DiscardedCandidate) -> None:
-        self._discarded.append(discarded)
+        with self._lock:
+            self._discarded.append(discarded)
 
     def discarded(self) -> list[DiscardedCandidate]:
         return self._discarded

@@ -1,0 +1,17 @@
+# Scan output — may contain sensitive client/target data, never commit
+reports/
+
+# Resume checkpoints
+.vectrix_state/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Tool scratch
+*.log
+.DS_Store

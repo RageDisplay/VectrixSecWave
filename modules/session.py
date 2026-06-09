@@ -7,6 +7,8 @@ from typing import Optional
 import requests
 import urllib3
 
+from .resilient import ResilientSession
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DEFAULT_TIMEOUT = 15
@@ -25,8 +27,19 @@ def build_session(
     proxy: Optional[str] = None,
     verify_ssl: bool = False,
     timeout: int = DEFAULT_TIMEOUT,
+    delay: float = 0.5,
+    jitter: float = 0.5,
+    max_retries: int = 3,
+    detect_session_expiry: bool = True,
+    verbose: bool = False,
 ) -> requests.Session:
-    session = requests.Session()
+    session = ResilientSession(
+        delay=delay,
+        jitter=jitter,
+        max_retries=max_retries,
+        detect_session_expiry=detect_session_expiry,
+        verbose=verbose,
+    )
     session.verify = verify_ssl
     session.timeout = timeout  # type: ignore[attr-defined]  # stored for modules to read
 
@@ -61,6 +74,11 @@ def build_session(
     if proxy:
         proxies = {"http": proxy, "https": proxy}
         session.proxies.update(proxies)
+
+    # Tell the session it has auth, so it can detect mid-scan session expiry.
+    if (cookie_string or cookie_file or token or basic_auth
+            or (extra_headers and any(":" in h for h in extra_headers))):
+        session.mark_auth_configured()
 
     return session
 
