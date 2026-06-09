@@ -19,7 +19,11 @@ import requests
 
 from . import adaptive
 from .findings import Finding, FindingStore, Severity
-from .checks.ratelimit import LOGIN_PATHS
+LOGIN_PATHS = [
+    "/login", "/signin", "/api/login", "/api/signin",
+    "/api/auth/login", "/api/auth/token", "/api/token",
+    "/api/v1/login", "/api/v2/login", "/auth/local",
+]
 
 
 # ── Generic param-replay (chain rules run after Candidate.context closures are
