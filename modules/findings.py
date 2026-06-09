@@ -5,6 +5,38 @@ from typing import Any, Optional
 import uuid
 
 
+# OWASP Top 10 2021 — maps category keyword → (OWASP ID, short label)
+OWASP_CATEGORY_MAP: dict[str, tuple[str, str]] = {
+    "Injection":               ("A03:2021", "Injection"),
+    "XSS":                     ("A03:2021", "Injection"),
+    "SSRF":                    ("A10:2021", "SSRF"),
+    "CORS":                    ("A05:2021", "Security Misconfiguration"),
+    "Security Headers":        ("A05:2021", "Security Misconfiguration"),
+    "Authentication":          ("A07:2021", "Auth & Identification Failures"),
+    "Session Management":      ("A07:2021", "Auth & Identification Failures"),
+    "CSRF":                    ("A01:2021", "Broken Access Control"),
+    "IDOR":                    ("A01:2021", "Broken Access Control"),
+    "BOLA":                    ("A01:2021", "Broken Access Control"),
+    "Open Redirect":           ("A01:2021", "Broken Access Control"),
+    "Information Disclosure":  ("A02:2021", "Cryptographic Failures"),
+    "SSL/TLS":                 ("A02:2021", "Cryptographic Failures"),
+    "Rate Limiting":           ("A05:2021", "Security Misconfiguration"),
+}
+
+OWASP_FULL_NAMES: dict[str, str] = {
+    "A01:2021": "Broken Access Control",
+    "A02:2021": "Cryptographic Failures",
+    "A03:2021": "Injection",
+    "A04:2021": "Insecure Design",
+    "A05:2021": "Security Misconfiguration",
+    "A06:2021": "Vulnerable & Outdated Components",
+    "A07:2021": "Identification & Authentication Failures",
+    "A08:2021": "Software & Data Integrity Failures",
+    "A09:2021": "Security Logging & Monitoring Failures",
+    "A10:2021": "Server-Side Request Forgery",
+}
+
+
 class Severity(str, Enum):
     CRITICAL = "CRITICAL"
     HIGH     = "HIGH"
@@ -66,6 +98,16 @@ class Finding:
     # for deterministic findings — lets later phases (chains.py) dispatch on the
     # underlying technique without fragile title/category string-matching.
     kind: str = ""
+    # Target hostname/URL — set automatically in multi-domain scans
+    target: str = ""
+
+    @property
+    def owasp(self) -> tuple[str, str]:
+        """Return (OWASP ID, short name) derived from category."""
+        for key, pair in OWASP_CATEGORY_MAP.items():
+            if key.lower() in self.category.lower():
+                return pair
+        return ("A05:2021", "Security Misconfiguration")
 
 
 @dataclass
@@ -107,6 +149,18 @@ class FindingStore:
 
     def counts(self) -> dict[str, int]:
         return {s.value: len(self.by_severity(s)) for s in Severity}
+
+    def owasp_counts(self) -> dict[str, int]:
+        """Return {owasp_id: count} across all findings."""
+        result: dict[str, int] = {}
+        for f in self._findings:
+            oid = f.owasp[0]
+            result[oid] = result.get(oid, 0) + 1
+        return result
+
+    def targets(self) -> list[str]:
+        """Return sorted list of unique target values (non-empty only)."""
+        return sorted({f.target for f in self._findings if f.target})
 
     def __len__(self) -> int:
         return len(self._findings)

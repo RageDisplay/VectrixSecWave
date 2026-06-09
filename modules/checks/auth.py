@@ -5,13 +5,20 @@ import hashlib
 import hmac
 import re
 import time
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 import requests
 
 from ..adaptive import Candidate
 from ..findings import Finding, Severity
 from ..session import session_to_curl_flags
 
+
+CSRF_TOKEN_NAMES = re.compile(
+    r'^(csrf|_csrf|csrftoken|csrf_token|csrfmiddlewaretoken|'
+    r'authenticity_token|_token|anti_csrf|xsrf|_xsrf|'
+    r'__RequestVerificationToken|x-csrf-token|x-xsrf-token)$',
+    re.IGNORECASE,
+)
 
 JWT_WEAK_SECRETS = [
     "secret", "password", "123456", "test", "dev", "development",
@@ -49,57 +56,61 @@ def run(session: requests.Session, base_url: str, endpoints: list, store) -> Non
     _check_auth_bypass_headers(session, base_url, curl_auth, timeout, store)
     _check_session_fixation(session, base_url, curl_auth, timeout, store)
     _check_password_in_response(session, endpoints, curl_auth, timeout, store)
+    _check_csrf(session, base_url, endpoints, curl_auth, timeout, store)
 
 
 def _check_cookies(session, base_url, curl_auth, store):
-    issues = []
-    for cookie in session.cookies:
-        name = cookie.name
-        secure = getattr(cookie, 'secure', False)
-        http_only = getattr(cookie, 'has_nonstandard_attr', lambda x: False)('httponly')
+    try:
+        resp = session.get(base_url, timeout=8)
+    except Exception:
+        return
 
-        # Check via raw Set-Cookie
-        try:
-            resp = requests.get(base_url, timeout=8, verify=False)
-            for sc in resp.headers.get_all('set-cookie') if hasattr(resp.headers, 'get_all') else [resp.headers.get('set-cookie', '')]:
-                if not sc:
-                    continue
-                sc_lower = sc.lower()
-                cname = sc.split('=')[0].strip()
+    # urllib3 raw headers support multi-value (several Set-Cookie lines)
+    raw_hdrs = resp.raw.headers
+    if hasattr(raw_hdrs, 'getlist'):
+        set_cookies = raw_hdrs.getlist('Set-Cookie')
+    else:
+        sc_single = resp.headers.get('Set-Cookie', '')
+        set_cookies = [sc_single] if sc_single else []
 
-                flags = []
-                if 'secure' not in sc_lower and base_url.startswith('https'):
-                    flags.append("отсутствует флаг Secure")
-                if 'httponly' not in sc_lower:
-                    flags.append("отсутствует флаг HttpOnly")
-                if 'samesite' not in sc_lower:
-                    flags.append("отсутствует атрибут SameSite")
-                elif 'samesite=none' in sc_lower and 'secure' not in sc_lower:
-                    flags.append("SameSite=None без Secure — небезопасная конфигурация")
+    seen: set[str] = set()
+    for sc in set_cookies:
+        if not sc:
+            continue
+        cname = sc.split('=')[0].strip()
+        if cname in seen:
+            continue
+        seen.add(cname)
 
-                if flags:
-                    issues.append((cname, flags, sc))
-        except Exception:
-            break
+        sc_lower = sc.lower()
+        flags = []
+        if 'secure' not in sc_lower and base_url.startswith('https'):
+            flags.append("отсутствует флаг Secure")
+        if 'httponly' not in sc_lower:
+            flags.append("отсутствует флаг HttpOnly")
+        if 'samesite' not in sc_lower:
+            flags.append("отсутствует атрибут SameSite")
+        elif 'samesite=none' in sc_lower and 'secure' not in sc_lower:
+            flags.append("SameSite=None без Secure — небезопасная конфигурация")
 
-    for cname, flags, raw in issues:
-        store.add(Finding(
-            title=f"Небезопасные флаги куки '{cname}'",
-            severity=Severity.MEDIUM,
-            category="Session Management",
-            cwe="CWE-614",
-            description=(
-                f"Cookie '{cname}' имеет небезопасную конфигурацию:\n• "
-                + "\n• ".join(flags)
-            ),
-            url=base_url,
-            evidence=f"Set-Cookie: {raw[:300]}",
-            remediation=(
-                f"Установите безопасные флаги:\n"
-                f"Set-Cookie: {cname}=<value>; Secure; HttpOnly; SameSite=Strict; Path=/"
-            ),
-            reproduction=f"curl -sk {curl_auth} -I '{base_url}' | grep -i set-cookie",
-        ))
+        if flags:
+            store.add(Finding(
+                title=f"Небезопасные флаги куки '{cname}'",
+                severity=Severity.MEDIUM,
+                category="Session Management",
+                cwe="CWE-614",
+                description=(
+                    f"Cookie '{cname}' имеет небезопасную конфигурацию:\n• "
+                    + "\n• ".join(flags)
+                ),
+                url=base_url,
+                evidence=f"Set-Cookie: {sc[:300]}",
+                remediation=(
+                    f"Установите безопасные флаги:\n"
+                    f"Set-Cookie: {cname}=<value>; Secure; HttpOnly; SameSite=Strict; Path=/"
+                ),
+                reproduction=f"curl -sk {curl_auth} -I '{base_url}' | grep -i set-cookie",
+            ))
 
 
 def _check_jwt(session, base_url, curl_auth, store):
@@ -454,6 +465,74 @@ def _check_password_in_response(session, endpoints, curl_auth, timeout, store):
                 ))
         except Exception:
             pass
+
+
+# ── CSRF ──────────────────────────────────────────────────────────────────────
+
+def _check_csrf(session, base_url, endpoints, curl_auth, timeout, store):
+    """Check for missing CSRF tokens on state-changing form endpoints."""
+    form_endpoints = [
+        ep for ep in endpoints
+        if ep.method in ("POST", "PUT", "PATCH", "DELETE") and ep.source == "form"
+    ]
+
+    reported_urls: set[str] = set()
+    for ep in form_endpoints:
+        if ep.url in reported_urls:
+            continue
+
+        has_csrf = any(CSRF_TOKEN_NAMES.match(k) for k in ep.body_params)
+        if has_csrf:
+            continue
+
+        # Double-check: fetch the form page and look for CSRF token in hidden inputs
+        try:
+            page_resp = session.get(ep.url, timeout=timeout)
+            page_text = page_resp.text.lower()
+            # Quick regex scan for common CSRF field patterns in the page source
+            if re.search(
+                r'name=["\'](?:csrf|_csrf|csrftoken|csrf_token|csrfmiddlewaretoken|'
+                r'authenticity_token|__requestverificationtoken|x-csrf-token)["\']',
+                page_text,
+            ):
+                continue  # Found in HTML — server does have CSRF protection
+        except Exception:
+            pass
+
+        reported_urls.add(ep.url)
+        field_list = list(ep.body_params.keys())
+        sample_data = urlencode({k: 'test' for k in field_list})
+
+        store.add(Finding(
+            title=f"Отсутствует CSRF-токен в форме — {ep.url}",
+            severity=Severity.HIGH,
+            category="CSRF",
+            cwe="CWE-352",
+            description=(
+                f"Форма ({ep.method} {ep.url}) не содержит CSRF-токена ни в одном поле.\n"
+                "Атакующий может создать вредоносную страницу, которая от имени "
+                "аутентифицированного пользователя выполнит нежелательное действие.\n"
+                f"Обнаруженные поля: {field_list}"
+            ),
+            url=ep.url,
+            method=ep.method,
+            evidence=f"Поля формы: {field_list}\nCSRF-токен не найден",
+            remediation=(
+                "1. Добавьте синхронизированный CSRF-токен во все формы.\n"
+                "2. Проверяйте Origin/Referer заголовки на стороне сервера.\n"
+                "3. Установите SameSite=Strict или SameSite=Lax на сессионных куки.\n"
+                "4. Для SPA используйте заголовок X-CSRF-Token + Double Submit Cookie."
+            ),
+            reproduction=(
+                f"# Отправка запроса без CSRF-токена (должен быть отклонён):\n"
+                f"curl -sk {curl_auth} -X {ep.method} -d '{sample_data}' '{ep.url}'\n\n"
+                f"# PoC HTML (разместить на стороннем домене):\n"
+                f"<form method='{ep.method.lower()}' action='{ep.url}'>\n"
+                + "".join(f"  <input type='hidden' name='{k}' value='attacker'>\n"
+                          for k in field_list[:3])
+                + "  <input type='submit' value='Click me'>\n</form>"
+            ),
+        ))
 
 
 # ── JWT helpers ───────────────────────────────────────────────────────────────
