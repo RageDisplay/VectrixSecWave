@@ -21,6 +21,10 @@ OWASP_CATEGORY_MAP: dict[str, tuple[str, str]] = {
     "Information Disclosure":  ("A02:2021", "Cryptographic Failures"),
     "SSL/TLS":                 ("A02:2021", "Cryptographic Failures"),
     "Rate Limiting":           ("A05:2021", "Security Misconfiguration"),
+    "Access Control":          ("A01:2021", "Broken Access Control"),
+    "XXE":                     ("A03:2021", "Injection"),
+    "Host Header":             ("A05:2021", "Security Misconfiguration"),
+    "Host Injection":          ("A05:2021", "Security Misconfiguration"),
 }
 
 OWASP_FULL_NAMES: dict[str, str] = {

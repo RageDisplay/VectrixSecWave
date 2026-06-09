@@ -115,6 +115,7 @@ def _check_cookies(session, base_url, curl_auth, store):
 
 def _check_jwt(session, base_url, curl_auth, store):
     all_tokens = []
+    timeout = getattr(session, 'timeout', 15)
 
     # From Authorization header
     auth = session.headers.get("Authorization", "")
@@ -130,7 +131,8 @@ def _check_jwt(session, base_url, curl_auth, store):
             all_tokens.append((f"Cookie: {cookie.name}", val))
 
     for source, token in all_tokens:
-        _analyze_jwt(token, source, base_url, curl_auth, store)
+        _analyze_jwt(token, source, base_url, curl_auth, store,
+                     session=session, timeout=timeout)
 
 
 def _is_jwt(s: str) -> bool:
@@ -138,7 +140,8 @@ def _is_jwt(s: str) -> bool:
     return len(parts) == 3
 
 
-def _analyze_jwt(token: str, source: str, base_url: str, curl_auth: str, store) -> None:
+def _analyze_jwt(token: str, source: str, base_url: str, curl_auth: str, store,
+                 session=None, timeout: int = 15) -> None:
     parts = token.split(".")
     if len(parts) != 3:
         return
@@ -251,6 +254,14 @@ def _analyze_jwt(token: str, source: str, base_url: str, curl_auth: str, store) 
                 f"echo '{parts[1]}' | base64 -d 2>/dev/null | python3 -m json.tool"
             ),
         ))
+
+    # 3b. kid injection
+    _check_jwt_kid_injection(token, header, payload, source, base_url, curl_auth, store)
+
+    # 3c. Key confusion (RS256/ES256 → HS256)
+    if session is not None:
+        _check_jwt_key_confusion(token, header, payload, source, base_url,
+                                  curl_auth, session, timeout, store)
 
     # 4. Проверка exp
     exp = payload.get("exp")
@@ -531,6 +542,175 @@ def _check_csrf(session, base_url, endpoints, curl_auth, timeout, store):
                 + "".join(f"  <input type='hidden' name='{k}' value='attacker'>\n"
                           for k in field_list[:3])
                 + "  <input type='submit' value='Click me'>\n</form>"
+            ),
+        ))
+
+
+# ── JWT key confusion + kid injection ────────────────────────────────────────
+
+def _check_jwt_key_confusion(token: str, header: dict, payload: dict,
+                              source: str, base_url: str, curl_auth: str,
+                              session, timeout, store) -> None:
+    """RS256/ES256 → HS256 key confusion attack.
+
+    If the server uses an asymmetric algorithm and the public key is obtainable
+    (JWKS endpoint, well-known URL, or leaked in a response), an attacker can
+    sign a forged token with HS256 using the public key as the HMAC secret.
+    The server's JWT library accepts it if it doesn't enforce algorithm binding.
+    """
+    alg = header.get("alg", "").upper()
+    if alg not in ("RS256", "RS384", "RS512", "ES256", "ES384", "ES512"):
+        return
+
+    # Try standard JWKS locations
+    parsed = urlparse(base_url)
+    jwks_candidates = [
+        f"{parsed.scheme}://{parsed.netloc}/.well-known/jwks.json",
+        f"{parsed.scheme}://{parsed.netloc}/.well-known/openid-configuration",
+        f"{parsed.scheme}://{parsed.netloc}/oauth/jwks",
+        f"{parsed.scheme}://{parsed.netloc}/api/auth/jwks",
+        f"{parsed.scheme}://{parsed.netloc}/.well-known/keys",
+    ]
+
+    public_key_pem: str | None = None
+    for url in jwks_candidates:
+        try:
+            r = session.get(url, timeout=timeout)
+            if r.status_code == 200 and ("keys" in r.text or "BEGIN PUBLIC KEY" in r.text):
+                public_key_pem = r.text[:2000]
+                break
+        except Exception:
+            continue
+
+    if not public_key_pem:
+        # Even without the public key, report the attack surface
+        store.add(Finding(
+            title=f"JWT: алгоритм {alg} — потенциальная уязвимость Key Confusion (RS→HS)",
+            severity=Severity.HIGH,
+            category="Authentication",
+            cwe="CWE-347",
+            description=(
+                f"JWT использует асимметричный алгоритм {alg} ({source}). "
+                "Если сервер не привязывает алгоритм при валидации, атакующий "
+                "может подменить alg на HS256 и подписать токен публичным ключом сервера "
+                "как HMAC-секретом.\n\n"
+                "Атака:\n"
+                "1. Получить публичный ключ (JWKS, /api/publickey, утечки)\n"
+                "2. Изменить alg: HS256 в header\n"
+                "3. Подписать HMAC-SHA256 с публичным ключом как секретом\n"
+                "4. Сервер принимает токен если lib не проверяет alg"
+            ),
+            url=base_url,
+            evidence=f"Header: {header}\nPayload: {payload}\nJWKS endpoint: не найден, ручная проверка требуется",
+            remediation=(
+                "1. Явно передавайте ожидаемый алгоритм при верификации:\n"
+                "   jwt.verify(token, publicKey, { algorithms: ['RS256'] })\n"
+                "2. Никогда не используйте algorithms=['HS256','RS256'] одновременно.\n"
+                "3. Обновите JWT-библиотеку (CVE-2015-9235, CVE-2016-10555)."
+            ),
+            reproduction=(
+                f"# Проверить JWKS:\n"
+                f"curl -sk {curl_auth} '{parsed.scheme}://{parsed.netloc}/.well-known/jwks.json'\n\n"
+                f"# Инструмент для атаки:\n"
+                f"python3 -c \"\nimport jwt, json, base64\n"
+                f"# Получить pub key и подписать с alg=HS256\n"
+                f"forged = jwt.encode({payload}, pub_key_bytes, algorithm='HS256')\n\""
+            ),
+        ))
+        return
+
+    # We have a JWKS/key response — report with concrete PoC
+    store.add(Finding(
+        title=f"JWT: Key Confusion {alg}→HS256 — публичный ключ доступен",
+        severity=Severity.CRITICAL,
+        category="Authentication",
+        cwe="CWE-347",
+        description=(
+            f"JWT использует {alg} ({source}), и публичный ключ доступен по well-known URL.\n\n"
+            "Атакующий может подписать произвольный токен с alg=HS256, используя "
+            "публичный ключ как HMAC-секрет. Если сервер не зафиксировал алгоритм — "
+            "токен будет принят, что позволяет выдать себя за любого пользователя."
+        ),
+        url=base_url,
+        evidence=(
+            f"Алгоритм: {alg}\nПубличный ключ доступен:\n{public_key_pem[:300]}..."
+        ),
+        remediation=(
+            "1. jwt.verify(token, publicKey, { algorithms: ['RS256'] }) — фиксируйте алгоритм.\n"
+            "2. Используйте раздельные конфиги для RS256 и HS256 путей.\n"
+            "3. Обновите JWT-библиотеки; проверьте CVE-2022-21449 (ECDSA)."
+        ),
+        reproduction=(
+            f"# pip install PyJWT cryptography\n"
+            f"python3 -c \"\n"
+            f"import jwt\n"
+            f"# Извлечь публичный ключ из JWKS и конвертировать в PEM\n"
+            f"forged_payload = {payload}\n"
+            f"forged_payload['role'] = 'admin'\n"
+            f"token = jwt.encode(forged_payload, pub_key_pem, algorithm='HS256')\n"
+            f"# Отправить token в заголовке Authorization: Bearer <token>\n\""
+        ),
+    ))
+
+
+def _check_jwt_kid_injection(token: str, header: dict, payload: dict,
+                              source: str, base_url: str, curl_auth: str, store) -> None:
+    """JWT kid (key ID) header parameter injection.
+
+    kid is sometimes used as a file path or SQL query without sanitisation.
+    """
+    kid = header.get("kid", "")
+    if not kid:
+        return
+
+    issues = []
+
+    # SQL injection in kid
+    if re.search(r"[\'\"\;\-\-]", kid):
+        issues.append((
+            "kid содержит SQL-мета-символы — возможна SQL-инъекция",
+            "CWE-89",
+            (
+                "Некоторые реализации делают SQL-запрос: "
+                "SELECT key FROM keys WHERE id='<kid>'\n"
+                "Payload: ' UNION SELECT 'attacker_secret'-- позволяет задать произвольный секрет"
+            ),
+        ))
+
+    # Path traversal in kid
+    if ".." in kid or kid.startswith("/"):
+        issues.append((
+            "kid содержит path traversal — возможно чтение произвольного файла как ключа",
+            "CWE-22",
+            (
+                "Если kid используется как путь к файлу с ключом, "
+                "атакующий может указать /dev/null или известный файл "
+                "и подписать токен пустым/предсказуемым ключом."
+            ),
+        ))
+
+    for title_suffix, cwe, detail in issues:
+        store.add(Finding(
+            title=f"JWT kid injection — {title_suffix}",
+            severity=Severity.HIGH,
+            category="Authentication",
+            cwe=cwe,
+            description=(
+                f"Параметр kid в JWT header: '{kid}'\n"
+                f"Источник: {source}\n\n{detail}"
+            ),
+            url=base_url,
+            evidence=f"JWT header: {header}",
+            remediation=(
+                "1. Валидируйте kid по строгому whitelist (UUID, числовой ID).\n"
+                "2. Никогда не используйте kid напрямую в SQL-запросах или как путь к файлу.\n"
+                "3. Храните ключи в key management service (AWS KMS, HashiCorp Vault)."
+            ),
+            reproduction=(
+                f"# Декодировать header:\n"
+                f"echo '{token.split('.')[0]}' | base64 -d 2>/dev/null\n"
+                f"# PoC payload с injected kid:\n"
+                f"# kid: \\' UNION SELECT 'mysecret'--"
             ),
         ))
 

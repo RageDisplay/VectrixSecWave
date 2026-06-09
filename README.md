@@ -34,8 +34,9 @@
    Полный список — в [requirements-kali.txt](requirements-kali.txt).
    Внешние тулзы (`nikto`, `nuclei`, `gobuster`, `sqlmap`, `whatweb`, `wafw00f`, `sslscan`)
    не обязательны — если утилита не установлена, её проверка пропускается с пометкой
-   в логе. Без них работает собственный движок (Headers, TLS, Auth/CSRF, CORS, IDOR,
-   SSRF, Disclosure, Injection, Rate Limiting, адаптивное подтверждение).
+   в логе. Без них работает собственный движок (Headers, TLS, Auth/JWT/CSRF, CORS, IDOR,
+   SSRF, Disclosure, Injection, XXE, Host Injection, Account Enum,
+   Verb Tampering/Mass Assignment, адаптивное подтверждение).
 
 3. Проверить запуск:
 
@@ -85,7 +86,7 @@ admin.bank.internal:8443
 | Режим | Что делает | Инструменты | Время |
 |-------|-----------|-------------|-------|
 | `safe` | Только passive: headers, TLS, sensitive paths, технологии. Никаких payload'ов | whatweb, wafw00f | ~30 сек |
-| `medium` | + CORS, IDOR, SSRF, rate limit, injection (без sqlmap) | + nikto | ~5–10 мин |
+| `medium` | + CORS, IDOR, SSRF, injection, XXE, Host Injection, Account Enum, Verb Tampering (без sqlmap) | + nikto | ~5–15 мин |
 | `aggressive` | + time-based SQLi, nuclei (все CVE-шаблоны), gobuster, sqlmap на найденных параметрах | + nuclei, gobuster, sqlmap | ~20–40 мин |
 
 Режим по умолчанию — `medium`.
@@ -102,14 +103,20 @@ admin.bank.internal:8443
 |--------|------|--------|------------|
 | Headers / TLS | + | + | + |
 | Auth / JWT / CSRF (passive) | + | + | + |
+| JWT: alg:none, слабый секрет, kid-инъекция, key confusion | + | + | + |
+| CRLF / HTTP Response Splitting | — | + | + |
 | CORS | + | + | + |
-| Sensitive paths | + | + | + |
-| Injection (error-based) | — | + | + |
-| Injection (time-based blind) | — | — | + |
+| Sensitive paths (disclosure) | + | + | + |
+| Injection (error-based SQLi, XSS, SSTI, CMDi, LFI) | — | + | + |
+| Injection (time-based blind SQLi) | — | — | + |
 | XSS (расширенные payload'ы) | — | базовые | все |
 | IDOR / BOLA | — | + | + |
 | SSRF | — | + | + |
-| Rate Limiting | — | + | + |
+| XXE (file read, SSRF, error-based, param entity) | — | + | + |
+| Host Header Injection / password reset poisoning | — | + | + |
+| Account Enumeration (status, size, timing, error msg) | — | + | + |
+| HTTP Verb Tampering / Method Override bypass | — | + | + |
+| Mass Assignment (JSON bait fields) | — | + | + |
 | whatweb / wafw00f | + | + | + |
 | nikto | — | + | + |
 | nuclei (по найденным эндпоинтам + теги по технологиям) | — | лёгкий проход | полный проход |
@@ -198,14 +205,18 @@ python3 pentest.py -u https://target.bank.internal \
 |--------|-----------|-----------|
 | Headers | CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Cache-Control, Server banner | A05 |
 | SSL/TLS | SSLv2/3, TLS 1.0/1.1, слабые шифры (RC4/DES/NULL), срок сертификата, mixed content, HTTP→HTTPS redirect | A02 |
-| Injection | SQLi (error-based + time-blind), XSS reflected, SSTI, CMDi, Path Traversal/LFI, Open Redirect | A03 |
-| Auth / Session | JWT (alg:none, слабый секрет, no exp, длинный exp), Cookie flags (Secure/HttpOnly/SameSite), чувствительное в URL, auth bypass via headers, session fixation | A07 |
+| Injection | SQLi (error-based + time-blind), XSS reflected, SSTI, CMDi, Path Traversal/LFI, Open Redirect, CRLF/HTTP Response Splitting | A03 |
+| Auth / Session | JWT (alg:none, слабый секрет, no exp/длинный exp, kid-инъекция SQL+path, RS256→HS256 key confusion), Cookie flags (Secure/HttpOnly/SameSite), auth bypass via headers, session fixation | A07 |
 | CSRF | Отсутствие CSRF-токена в POST-формах; двойная проверка через повторный GET страницы перед репортом | A01 |
 | CORS | Origin reflection + credentials, null origin, wildcard + credentials | A05 |
 | IDOR / BOLA | Числовые ID ±1/2 в path и query, UUID замена в path | A01 |
 | SSRF | URL-параметры → 127.0.0.1, cloud metadata (AWS/GCP/Azure), file://, gopher://, blind SSRF | A10 |
+| XXE | file:///etc/passwd, AWS/GCP metadata SSRF, error-based, parameter entity, SOAP-обёртка; differential-подтверждение | A03 |
+| Host Injection | Host header reflection, X-Forwarded-Host bypass, password reset poisoning | A05 |
+| Account Enum | Перебор по: HTTP статусу, размеру ответа (>12%), timing (>400ms), тексту ошибки на login/register/reset | A07 |
+| Verb Tampering | HTTP TRACE/XST, метод-обход restricted endpoints (GET→POST/DELETE), X-HTTP-Method-Override bypass | A01 |
+| Mass Assignment | Инъекция is_admin/role/price в JSON-эндпоинты, отражение bait-полей в ответе | A01 |
 | Disclosure | Swagger/OpenAPI, Spring Actuator, .env, .git/config, verbose errors, секреты в ответах (AWS keys, JWT secrets, DB URLs), GraphQL introspection | A02 |
-| Rate Limiting | Login endpoints, API endpoints | A05 |
 | External tools | nikto, nuclei (целево — по эндпоинтам и whatweb-фингерпринту), whatweb, wafw00f, gobuster, sqlmap | — |
 
 ---
@@ -397,5 +408,8 @@ web-pentest-toolkit/
 │       ├── idor.py         # IDOR / BOLA
 │       ├── ssrf.py         # SSRF
 │       ├── disclosure.py   # Information Disclosure
-│       └── ratelimit.py    # Rate Limiting
+│       ├── xxe.py          # XXE (file read, SSRF, error-based, param entity)
+│       ├── hostinjection.py# Host Header Injection / password reset poisoning
+│       ├── account_enum.py # Account enumeration via response differences
+│       └── verbtamper.py   # HTTP Verb Tampering, Method Override, Mass Assignment
 ```

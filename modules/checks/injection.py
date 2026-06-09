@@ -110,6 +110,18 @@ LFI_SIGNATURES = [
     r"for 16-bit app support",
 ]
 
+# ── CRLF / HTTP Response Splitting ────────────────────────────────────────────
+
+CRLF_MARKER = "X-Vectrix-Crlf-Probe"
+CRLF_PAYLOADS = [
+    ("%0d%0a" + CRLF_MARKER + ":%20injected",  "URL-encoded CRLF"),
+    ("%0a"    + CRLF_MARKER + ":%20injected",  "LF only (nginx)"),
+    ("%E5%98%8A%E5%98%8D" + CRLF_MARKER + ":%20injected", "UTF-8 overlong CRLF"),
+    ("%0d%0aSet-Cookie:%20vectrix-session=injected;%20HttpOnly",
+     "CRLF cookie injection"),
+]
+
+
 # ── Open Redirect ─────────────────────────────────────────────────────────────
 
 REDIRECT_PARAMS = ["redirect", "redirect_to", "redirect_url", "next", "url",
@@ -154,6 +166,7 @@ def run(
         _check_ssti(session, ep, params, body_params, curl_auth, timeout, store)
         _check_cmdi(session, ep, params, body_params, curl_auth, timeout, store)
         _check_path_traversal(session, ep, params, body_params, curl_auth, timeout, store)
+        _check_crlf(session, ep, params, body_params, curl_auth, timeout, store)
 
     _check_open_redirect(session, base_url, endpoints, curl_auth, timeout, store)
 
@@ -410,6 +423,74 @@ def _check_path_traversal(session, ep, params, body_params, curl_auth, timeout, 
                         reproduction=curl_cmd,
                     ))
                     break
+
+
+# ── CRLF / HTTP Response Splitting ────────────────────────────────────────────
+
+def _check_crlf(session, ep, params, body_params, curl_auth, timeout, store):
+    """Inject CRLF sequences into parameters and look for reflected headers."""
+    target_params = list(params.items()) or list(body_params.items())
+
+    for param_name, _ in target_params:
+        for payload, technique in CRLF_PAYLOADS:
+            resp = _inject_param(session, ep, param_name, payload, params, body_params, timeout)
+            if resp is None:
+                continue
+
+            # Check if our marker or injected cookie appears in response headers
+            resp_headers_lower = {k.lower(): v for k, v in resp.headers.items()}
+            marker_lower = CRLF_MARKER.lower()
+
+            injected_in_headers = (
+                marker_lower in resp_headers_lower
+                or "vectrix-session" in resp_headers_lower
+                or any(marker_lower in v.lower() for v in resp.headers.values())
+            )
+
+            if not injected_in_headers:
+                # Also check if value appears literally unencoded in Location/Set-Cookie
+                location = resp.headers.get("location", "")
+                set_cookie = resp.headers.get("set-cookie", "")
+                if ("\r\n" in location or "\n" in location or
+                        "vectrix" in set_cookie.lower()):
+                    injected_in_headers = True
+
+            if not injected_in_headers:
+                continue
+
+            curl_cmd = _make_curl(ep, param_name, payload, curl_auth, params, body_params)
+            store.add(Finding(
+                title=f"CRLF Injection / HTTP Response Splitting — параметр '{param_name}'",
+                severity=Severity.HIGH,
+                category="Injection",
+                cwe="CWE-113",
+                description=(
+                    f"Параметр '{param_name}' ({ep.method} {ep.url}) отражается "
+                    f"в HTTP-заголовках ответа без фильтрации символов CR (\\r) / LF (\\n).\n"
+                    f"Техника: {technique}\n\n"
+                    "Последствия:\n"
+                    "• HTTP Response Splitting → cache poisoning\n"
+                    "• Инъекция Set-Cookie (угон сессии, XSS через cookie)\n"
+                    "• Обход WAF / security headers\n"
+                    "• Log injection (подделка записей в логах)"
+                ),
+                url=ep.url,
+                parameter=param_name,
+                method=ep.method,
+                evidence=(
+                    f"Payload: {payload[:100]}\n"
+                    f"Инъектированный заголовок найден в ответе"
+                ),
+                remediation=(
+                    "1. Фильтруйте или отклоняйте CR (\\r, %0d) и LF (\\n, %0a) "
+                    "   во всех входных данных, используемых для формирования заголовков.\n"
+                    "2. Используйте функции безопасного формирования заголовков фреймворка "
+                    "   вместо ручной конкатенации строк.\n"
+                    "3. Включите заголовок Content-Security-Policy для ограничения последствий."
+                ),
+                reproduction=curl_cmd,
+            ))
+            break  # One finding per param
 
 
 # ── Open Redirect ─────────────────────────────────────────────────────────────
